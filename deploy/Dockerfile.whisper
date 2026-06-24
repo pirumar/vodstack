@@ -1,0 +1,32 @@
+# faster-whisper ASR sidecar (CPU). CTranslate2 backend — light (no torch). It
+# produces word-level timestamps natively via word_timestamps=True, so we get
+# precise cue boundaries without WhisperX's heavy wav2vec2/pyannote/CUDA stack.
+#
+# The ASR model is downloaded on first start into a persistent HF cache volume
+# (see docker-compose: whispercache) rather than baked at build time — baking
+# stalls when HF Hub is slow/rate-limited, and the volume makes the download a
+# one-time cost that survives rebuilds.
+#
+# Embeddings for in-video search use a configurable remote provider by default; a
+# local sentence-transformers embedder is optional via EMBED_ENABLED=1 (~2GB).
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir faster-whisper==1.0.3 flask==3.0.3 requests
+
+# Optional local embedding model (off by default; default deployment is remote).
+ARG EMBED_ENABLED=0
+ENV EMBED_MODEL=BAAI/bge-m3
+RUN if [ "$EMBED_ENABLED" = "1" ]; then \
+      pip install --no-cache-dir sentence-transformers==3.0.1 && \
+      python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['EMBED_MODEL'])"; \
+    fi
+
+ENV WHISPER_MODEL=base
+# HF cache lives on a mounted volume; keep telemetry off.
+ENV HF_HUB_DISABLE_TELEMETRY=1
+
+COPY deploy/whisper/app.py /app/app.py
+WORKDIR /app
+
+EXPOSE 8000
+CMD ["python", "app.py"]

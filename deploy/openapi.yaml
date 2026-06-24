@@ -1,0 +1,276 @@
+openapi: 3.0.3
+info:
+  title: vodstack API
+  version: "1.0.0"
+  description: >
+    Self-hosted VOD streaming API (a Bunny Stream alternative). The library API is
+    authenticated with a per-library API key sent as `AccessKey: <key>` or
+    `Authorization: Bearer <key>`. Playback URLs are HMAC signed-URL tokens served
+    from the edge; an embeddable iframe player and a public viewer-analytics beacon
+    are also exposed.
+servers:
+  - url: http://localhost:8080
+    description: Local dev
+
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: AccessKey
+    Bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    Video:
+      type: object
+      properties:
+        videoId: { type: string, format: uuid }
+        libraryId: { type: string }
+        title: { type: string }
+        description: { type: string, description: "LLM-generated summary/description" }
+        tags:
+          type: array
+          items: { type: string }
+          description: "LLM-generated content tags"
+        status:
+          type: integer
+          description: "0 created, 1 uploaded, 2 processing, 3 transcoding, 4 finished, 5 failed"
+        length: { type: integer, description: seconds }
+        width: { type: integer }
+        height: { type: integer }
+        storageSize: { type: integer, format: int64 }
+        availableResolutions: { type: string, example: "360p,720p" }
+        encodeProgress: { type: integer }
+        errorMessage: { type: string }
+    PlayResponse:
+      type: object
+      properties:
+        videoId: { type: string }
+        isReady: { type: boolean }
+        status: { type: integer }
+        length: { type: integer }
+        hlsUrl: { type: string, description: "Signed master.m3u8 URL (avc1 plus av01/hvc1/vp09 when extra codecs are built)" }
+        posterUrl: { type: string }
+        thumbnailsUrl: { type: string }
+        chaptersUrl: { type: string }
+        mp4Url: { type: string, description: "Signed progressive MP4 (<=1080p) fallback URL, when MP4 fallback is enabled" }
+        downloadUrl: { type: string, description: "Signed original-file download URL, when AllowDownload is enabled" }
+        earlyPlay: { type: boolean, description: "True when the original is playable before encoding finishes (Early-Play)" }
+        earlyPlayUrl: { type: string, description: "Signed original URL for Early-Play (present only while not yet ready)" }
+        captions:
+          type: array
+          items:
+            type: object
+            properties:
+              lang: { type: string }
+              label: { type: string }
+              url: { type: string }
+    SearchHit:
+      type: object
+      properties:
+        videoId: { type: string }
+        title: { type: string }
+        lang: { type: string }
+        startSec: { type: number, description: "Seek target (seconds) for this transcript moment" }
+        endSec: { type: number }
+        snippet: { type: string }
+        score: { type: number, description: "Fused (RRF) relevance score" }
+    SearchResponse:
+      type: object
+      properties:
+        enabled: { type: boolean, description: "False when in-video search is disabled for the library" }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/SearchHit" }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+security:
+  - ApiKey: []
+  - Bearer: []
+
+paths:
+  /api/library/{libraryId}/videos:
+    post:
+      summary: Create a video record
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+                collectionId: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  videoId: { type: string }
+                  libraryId: { type: string }
+                  status: { type: integer }
+        "401": { description: Unauthorized, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { description: Rate limited }
+
+  /api/library/{libraryId}/videos/{videoId}/upload-url:
+    post:
+      summary: Get a presigned PUT URL for the raw source
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Presigned URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string }
+                  method: { type: string, example: PUT }
+                  object: { type: string }
+                  expires: { type: integer }
+
+  /api/library/{libraryId}/videos/{videoId}/complete:
+    post:
+      summary: Mark the upload complete and enqueue transcoding
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      responses:
+        "202": { description: Transcode enqueued }
+
+  /api/library/{libraryId}/videos/{videoId}/fetch:
+    post:
+      summary: Ingest from a source URL (migrate an existing video)
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+      responses:
+        "202": { description: Fetch + transcode enqueued }
+
+  /api/library/{libraryId}/videos/{videoId}:
+    get:
+      summary: Get video metadata
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Video
+          content: { application/json: { schema: { $ref: "#/components/schemas/Video" } } }
+        "404": { description: Not found }
+    delete:
+      summary: Soft-delete a video (recoverable trash)
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Deleted }
+
+  /api/library/{libraryId}/videos/{videoId}/play:
+    get:
+      summary: Mint a signed playback payload
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Signed play payload
+          content: { application/json: { schema: { $ref: "#/components/schemas/PlayResponse" } } }
+        "403": { description: Access expired }
+
+  /api/library/{libraryId}/videos/{videoId}/download:
+    get:
+      summary: Signed download URL for the original file (when AllowDownload is enabled)
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Download payload (downloadUrl) or an error field when disabled/unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  videoId: { type: string }
+                  downloadUrl: { type: string }
+                  error: { type: string }
+
+  /api/library/{libraryId}/search:
+    get:
+      summary: Hybrid in-video search over transcripts (semantic + lexical)
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: q, in: query, required: true, schema: { type: string }, description: "Search query" }
+        - { name: videoId, in: query, required: false, schema: { type: string }, description: "Restrict to one video" }
+      responses:
+        "200":
+          description: Matching transcript moments
+          content: { application/json: { schema: { $ref: "#/components/schemas/SearchResponse" } } }
+        "401": { description: Unauthorized }
+
+  /embed/{libraryId}/{videoId}:
+    get:
+      summary: Embeddable iframe player page (HTML, no auth)
+      security: []
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: HTML player, content: { text/html: {} } }
+
+  /beacon:
+    post:
+      summary: Viewer QoE beacon (public, no auth)
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [videoId, libraryId, sessionId, event]
+              properties:
+                videoId: { type: string }
+                libraryId: { type: string }
+                sessionId: { type: string }
+                event: { type: string, enum: [start, playing, rebuffer, error, progress, ended] }
+                position: { type: number }
+                value: { type: number }
+                bitrate: { type: integer }
+                resolution: { type: string }
+      responses:
+        "204": { description: Recorded }
+
+  /keys/{libraryId}/{videoId}:
+    get:
+      summary: AES-128 content key (gated by the playback token)
+      security: []
+      parameters:
+        - { name: libraryId, in: path, required: true, schema: { type: string } }
+        - { name: videoId, in: path, required: true, schema: { type: string } }
+        - { name: exp, in: query, required: true, schema: { type: integer } }
+        - { name: token, in: query, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 16-byte AES key, content: { application/octet-stream: {} } }
+        "403": { description: Missing/invalid token }

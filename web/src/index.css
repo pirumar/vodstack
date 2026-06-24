@@ -1,0 +1,124 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dark is the default palette (also applied via .dark). Channels are
+   space-separated RGB so Tailwind's <alpha-value> opacity modifiers work. */
+:root,
+.dark {
+  color-scheme: dark;
+
+  --c-ink: 11 12 14;
+  --c-graphite: 18 20 23;
+  --c-panel: 22 25 29;
+  --c-edge: 35 39 46;
+  --c-haze: 139 146 156;
+  --c-chalk: 238 241 244;
+  --c-signal: 255 158 44;
+  --c-signal-soft: 255 178 85;
+  --c-signal-deep: 224 124 18;
+  --c-ok: 61 220 151;
+  --c-warn: 255 194 75;
+  --c-bad: 255 93 93;
+  --c-idle: 91 100 112;
+
+  --shadow-deck: 0 1px 0 0 rgba(255, 255, 255, 0.04) inset, 0 20px 40px -24px rgba(0, 0, 0, 0.8);
+  --body-bg:
+    radial-gradient(120% 80% at 50% -10%, rgba(255, 158, 44, 0.10), transparent 60%),
+    linear-gradient(to bottom, #0d0e11, #0b0c0e);
+  --grid-line: rgba(255, 255, 255, 0.022);
+  --grain-opacity: 0.4;
+}
+
+/* Light palette: near-white base, white cards, deeper amber for contrast. */
+.light {
+  color-scheme: light;
+
+  --c-ink: 246 247 249;
+  --c-graphite: 236 238 242;
+  --c-panel: 255 255 255;
+  --c-edge: 216 220 226;
+  --c-haze: 92 99 110;
+  --c-chalk: 20 23 28;
+  --c-signal: 224 124 18;
+  --c-signal-soft: 255 158 44;
+  --c-signal-deep: 179 94 0;
+  --c-ok: 22 163 74;
+  --c-warn: 217 119 6;
+  --c-bad: 220 38 38;
+  --c-idle: 139 146 156;
+
+  --shadow-deck: 0 1px 0 0 rgba(255, 255, 255, 0.6) inset, 0 12px 30px -18px rgba(15, 23, 42, 0.22);
+  --body-bg:
+    radial-gradient(120% 80% at 50% -10%, rgba(255, 158, 44, 0.12), transparent 55%),
+    linear-gradient(to bottom, #fbfcfd, #eef1f5);
+  --grid-line: rgba(15, 23, 42, 0.04);
+  --grain-opacity: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-ink text-chalk font-sans antialiased;
+  /* Atmosphere: a faint amber spotlight from top, fine grid, and grain. */
+  background-image: var(--body-bg);
+  background-attachment: fixed;
+}
+
+/* Hairline technical grid overlay. */
+.deck-grid::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(120% 90% at 50% 0%, #000 30%, transparent 90%);
+}
+
+/* Film-grain overlay for texture. */
+.grain::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: var(--grain-opacity);
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+}
+
+.eyebrow {
+  @apply font-mono text-[10px] uppercase tracking-[0.28em] text-haze;
+}
+
+@layer components {
+  .input {
+    @apply rounded-lg border border-edge bg-ink/70 px-3 py-2 text-sm text-chalk outline-none transition focus:border-signal/60;
+  }
+  .btn-primary {
+    @apply inline-flex items-center gap-2 rounded-lg bg-signal px-4 py-2 text-sm font-semibold text-ink transition hover:bg-signal-soft disabled:opacity-40;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center gap-1.5 rounded-lg border border-edge bg-panel/50 px-3 py-2 text-haze transition hover:border-signal/40 hover:text-chalk;
+  }
+}
+
+/* Custom scrollbar to match the deck. */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  @apply bg-edge rounded-full;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}

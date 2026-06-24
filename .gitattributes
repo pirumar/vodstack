@@ -1,0 +1,19 @@
+# Normalize line endings to LF in the repo (project is deployed on Linux;
+# CRLF would break shell scripts and Dockerfiles when checked out there).
+* text=auto eol=lf
+
+# Force LF for files that must be LF regardless of platform.
+*.sh   text eol=lf
+*.go   text eol=lf
+*.py   text eol=lf
+*.conf text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Dockerfile* text eol=lf
+
+# Binary-ish assets: leave untouched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary

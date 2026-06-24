@@ -1,0 +1,338 @@
+# vodstack single-host stack.
+#
+# DEV (defaults, no env file needed) — behaves exactly as before:
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# PROD (fixed IP, only edge/web/api exposed publicly, everything else internal):
+#   docker compose --env-file deploy/.env.prod -f deploy/docker-compose.yml up --build -d
+#   (see deploy/.env.prod.example and deploy/DEPLOY.md)
+#
+# Every secret/URL/bind-address below falls back to its old dev value via
+# ${VAR:-default}, so running without an env file is unchanged.
+#
+# Port binding model:
+#   ${PUBLIC_IP:-0.0.0.0} -> viewer/admin facing (edge, web, api). In prod set
+#                            this to the server's fixed public IP.
+#   ${OPS_BIND:-0.0.0.0}  -> ops/debug only (minio, origin, prometheus,
+#                            grafana). In prod set to 127.0.0.1 so they are
+#                            reachable only via SSH tunnel, never the internet.
+#   postgres/redis/whisper publish NO host port at all (compose network only).
+name: vodstack
+
+services:
+  postgres:
+    # pgvector/pgvector ships the `vector` extension on top of stock Postgres 16
+    # (pg_trgm is bundled contrib). Same PG16 major as before, so the existing
+    # pgdata volume stays compatible. Needed by the in-video search feature.
+    image: pgvector/pgvector:pg16
+    restart: ${RESTART:-no}
+    environment:
+      POSTGRES_USER: ${PG_USER:-vodstack}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-vodstack}
+      POSTGRES_DB: ${PG_DB:-vodstack}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-vodstack} -d ${PG_DB:-vodstack}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: ${RESTART:-no}
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+
+  minio:
+    image: minio/minio:latest
+    restart: ${RESTART:-no}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minioadmin}
+    # Ops/debug only. In prod OPS_BIND=127.0.0.1 -> not reachable from internet
+    # (uploads go through the API BFF, so the S3 port never needs to be public).
+    ports:
+      - "${OPS_BIND:-0.0.0.0}:${MINIO_API_PORT:-19000}:9000"
+      - "${OPS_BIND:-0.0.0.0}:${MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the bucket and make the hls/ and raw/ prefixes anonymously
+  # readable so the origin nginx can proxy segments (hls) and original-file
+  # Early-Play/downloads (raw) to viewers. The edge enforces HMAC tokens; the
+  # origin is never publicly exposed, so anonymous-at-MinIO is gated by the edge.
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_USER:-minioadmin} ${MINIO_PASSWORD:-minioadmin};
+      mc mb --ignore-existing local/${MINIO_BUCKET:-vodstack-videos};
+      mc anonymous set download local/${MINIO_BUCKET:-vodstack-videos}/hls;
+      mc anonymous set download local/${MINIO_BUCKET:-vodstack-videos}/raw;
+      echo 'bucket ready';
+      "
+
+  api:
+    # Dev (default) builds locally; prod pulls a CI-built image from GHCR by
+    # setting IMAGE_PREFIX=ghcr.io/pirumar/vodstack + IMAGE_TAG, then
+    # `docker compose pull && docker compose up -d --no-build`.
+    image: ${IMAGE_PREFIX:-vodstack}/api:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    restart: ${RESTART:-no}
+    # CPU weight (relative, single-host). User-facing: under CPU contention the
+    # scheduler favours the api over the background worker/whisper (which are
+    # demoted below). A traffic spike on /play can no longer pin every core and
+    # starve cloudflared's heartbeat (the cause of the Error 1033 total outage).
+    cpu_shares: ${API_CPU_SHARES:-2048}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: "postgres://${PG_USER:-vodstack}:${PG_PASSWORD:-vodstack}@postgres:5432/${PG_DB:-vodstack}?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin}
+      MINIO_USE_SSL: "false"
+      MINIO_BUCKET: ${MINIO_BUCKET:-vodstack-videos}
+      # Signed HLS URLs point at the edge (token-enforced), not the origin.
+      # In prod set to http://<FIXED_IP>:8082 (see .env.prod).
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8082}
+      TOKEN_SECRET: ${TOKEN_SECRET:-dev-insecure-change-me}
+      UPLOAD_URL_TTL: ${UPLOAD_URL_TTL:-3600}
+      SEED_LIBRARY_ID: ${SEED_LIBRARY_ID:-default}
+      SEED_LIBRARY_API_KEY: ${SEED_LIBRARY_API_KEY:-dev-library-key}
+      # Admin panel login (BFF). Change in prod.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-vodstack-admin}
+      ADMIN_LIBRARY_ID: ${ADMIN_LIBRARY_ID:-default}
+      # In-flight resumable-upload chunks (tmpfs below).
+      TUS_DIR: "/tus"
+      # Externally reachable API base for <iframe> embed snippets.
+      # In prod set to http://<FIXED_IP>:8080 (see .env.prod).
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-http://localhost:8080}
+      # Search query-time embedding (local provider) calls the whisper sidecar's
+      # /embed; the API needs to reach it too, not just the worker.
+      WHISPER_URL: "http://whisper:8000"
+    tmpfs:
+      - /tus:mode=1777
+    ports:
+      - "${PUBLIC_IP:-0.0.0.0}:${API_PORT:-8080}:8080"
+
+  worker:
+    image: ${IMAGE_PREFIX:-vodstack}/worker:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    restart: ${RESTART:-no}
+    # Background transcode/ASR is the box's biggest CPU+RAM hog. Demote its CPU
+    # weight so it yields to api/cloudflared under contention, and cap its RAM so
+    # a runaway ffmpeg job can't OOM the whole single-host box. Raise the limit
+    # if you bump WORKER_CONCURRENCY or transcode 4K (check `docker stats`).
+    cpu_shares: ${WORKER_CPU_SHARES:-256}
+    mem_limit: ${WORKER_MEM_LIMIT:-3g}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: "postgres://${PG_USER:-vodstack}:${PG_PASSWORD:-vodstack}@postgres:5432/${PG_DB:-vodstack}?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin}
+      MINIO_USE_SSL: "false"
+      MINIO_BUCKET: ${MINIO_BUCKET:-vodstack-videos}
+      SCRATCH_DIR: "/scratch"
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      FFMPEG_BIN: "ffmpeg"
+      FFPROBE_BIN: "ffprobe"
+      # faster-whisper sidecar for auto-captions.
+      WHISPER_URL: "http://whisper:8000"
+      # Externally reachable API base baked into AES-128 playlist key URIs.
+      # The viewer's browser fetches the decryption key from here, so in prod
+      # set to http://<FIXED_IP>:8080 (see .env.prod).
+      KEY_BASE_URL: ${KEY_BASE_URL:-http://localhost:8080}
+    tmpfs:
+      - /scratch
+
+  # faster-whisper ASR sidecar (auto-captions). Internal-only; the worker calls
+  # it over HTTP. CPU-bound; base model baked into the image.
+  whisper:
+    image: ${IMAGE_PREFIX:-vodstack}/whisper:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.whisper
+    restart: ${RESTART:-no}
+    # ASR is CPU-bound and RAM-heavy (model + audio). Same treatment as worker:
+    # low CPU weight so it yields to user-facing traffic, RAM ceiling so it can't
+    # starve the box. Raise WHISPER_MEM_LIMIT if you switch to a larger model.
+    cpu_shares: ${WHISPER_CPU_SHARES:-256}
+    mem_limit: ${WHISPER_MEM_LIMIT:-4g}
+    environment:
+      # Authenticated HF Hub downloads (higher rate limit, faster/stable model
+      # pull). Provide via .env.prod; do NOT commit a real token.
+      HF_TOKEN: ${HF_TOKEN:-}
+    # Model cache persists across restarts/rebuilds (downloaded once on first start).
+    volumes:
+      - whispercache:/root/.cache/huggingface
+    # Surface the "process Up but port 8000 never bound" failure mode: the app
+    # loads the model BEFORE it starts serving, so until /healthz answers the
+    # sidecar isn't actually usable. No curl/wget in the slim image -> use python.
+    # start_period is generous so a genuine first-run model download isn't flagged.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 300s
+
+  # Origin: shields MinIO. Published on 8081 for debugging only; in prod it is
+  # internal (OPS_BIND=127.0.0.1) and NOT reachable by viewers.
+  origin:
+    image: nginx:1.27-alpine
+    restart: ${RESTART:-no}
+    depends_on:
+      - minio
+    volumes:
+      - ./nginx/origin.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${OPS_BIND:-0.0.0.0}:${ORIGIN_PORT:-8081}:80"
+
+  # Edge: viewer-facing tier. njs HMAC token enforcement + proxy_cache.
+  edge:
+    image: ${IMAGE_PREFIX:-vodstack}/edge:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.edge
+    restart: ${RESTART:-no}
+    depends_on:
+      - origin
+    environment:
+      # Must match the API's TOKEN_SECRET so signatures verify.
+      TOKEN_SECRET: ${TOKEN_SECRET:-dev-insecure-change-me}
+      # Key rotation: set this to the old secret while rotating; the edge accepts
+      # both so outstanding tokens stay valid until they expire.
+      TOKEN_SECRET_PREVIOUS: ${TOKEN_SECRET_PREVIOUS:-}
+    tmpfs:
+      - /var/cache/nginx
+    ports:
+      - "${PUBLIC_IP:-0.0.0.0}:${EDGE_PORT:-8082}:80"
+
+  # Web admin panel (React SPA) + /admin BFF proxy to the API.
+  web:
+    image: ${IMAGE_PREFIX:-vodstack}/web:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    restart: ${RESTART:-no}
+    depends_on:
+      - api
+    ports:
+      - "${PUBLIC_IP:-0.0.0.0}:${WEB_PORT:-8090}:80"
+
+  # --- Cloudflare CDN (optional) ---------------------------------------------
+  # Cloudflare Tunnel: outbound-only connection to Cloudflare's edge. Routes
+  # public hostnames (set in the Cloudflare Zero Trust dashboard) to the
+  # internal services over the compose network, so NO host port needs to be
+  # exposed and the origin IP stays hidden. Cloudflare terminates TLS (HTTPS)
+  # and caches /hls segments. See deploy/CDN.md.
+  #
+  # Enable with the "cdn" profile (only runs when you opt in):
+  #   docker compose --env-file deploy/.env.prod --profile cdn \
+  #     -f deploy/docker-compose.yml up -d
+  #
+  # In the dashboard, point the public hostnames at the internal services:
+  #   stream.<domain>  -> http://edge:80     (PUBLIC_BASE_URL)
+  #   api.<domain>     -> http://api:8080    (EMBED_BASE_URL / KEY_BASE_URL)
+  #   panel.<domain>   -> http://web:80      (admin panel, optional)
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["cdn"]
+    restart: ${RESTART:-no}
+    # Highest CPU weight on the box: the tunnel must always get enough CPU to send
+    # its heartbeat to Cloudflare's edge, even when every other service is maxed.
+    # Losing that heartbeat is what deregistered the tunnel and produced the
+    # site-wide Error 1033 outage under load. It is a tiny process, so a high
+    # weight costs nothing when idle and guarantees it wins under contention.
+    cpu_shares: ${CLOUDFLARED_CPU_SHARES:-4096}
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - edge
+      - api
+      - web
+
+  # --- Ops (debug/internal; OPS_BIND=127.0.0.1 in prod -> SSH tunnel only) ---
+  prometheus:
+    image: prom/prometheus:latest
+    restart: ${RESTART:-no}
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "${OPS_BIND:-0.0.0.0}:${PROMETHEUS_PORT:-9092}:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: ${RESTART:-no}
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-vodstack-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "${OPS_BIND:-0.0.0.0}:${GRAFANA_PORT:-3001}:3000"
+
+  # On-demand backup: docker compose -f deploy/docker-compose.yml run --rm backup
+  backup:
+    image: postgres:16-alpine
+    profiles: ["tools"]
+    depends_on:
+      - postgres
+      - minio
+    environment:
+      POSTGRES_HOST: "postgres"
+      POSTGRES_USER: ${PG_USER:-vodstack}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-vodstack}
+      POSTGRES_DB: ${PG_DB:-vodstack}
+      MINIO_HOST: "minio"
+      MINIO_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-vodstack-videos}
+      BACKUP_DIR: "/backups"
+    volumes:
+      - ./backup.sh:/backup.sh:ro
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["wget -qO /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && chmod +x /usr/local/bin/mc && sh /backup.sh"]
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  promdata:
+  grafanadata:
+  whispercache:

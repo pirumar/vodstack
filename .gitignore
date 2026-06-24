@@ -1,0 +1,33 @@
+# Build artifacts
+/bin/
+*.exe
+
+# Local env
+.env
+.env.prod
+deploy/.env.prod
+*.local
+
+# Backup output
+deploy/backups/
+
+# Scratch / transcode working dirs
+/scratch/
+/data/
+
+# Go
+vendor/
+
+# Node (web panel) — built in CI/Docker, not committed
+node_modules/
+web/dist/
+
+# Editor
+.idea/
+.vscode/
+
+# Claude Code local settings (per-developer)
+.claude/settings.local.json
+
+# Local curl cookie jar (dev test artifact)
+.fs.cookies

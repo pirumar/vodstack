@@ -1,0 +1,14 @@
+# Edge nginx with the njs module (HMAC token validation + proxy_cache).
+# The official nginx image is built from the nginx.org packages and configures
+# that apt repo, so nginx-module-njs is version-matched to the bundled nginx.
+FROM nginx:1.27
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx-module-njs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Load the njs module and preserve the token secrets for process.env in njs.
+RUN sed -i '1i load_module modules/ngx_http_js_module.so;\nenv TOKEN_SECRET;\nenv TOKEN_SECRET_PREVIOUS;' /etc/nginx/nginx.conf
+
+COPY deploy/nginx/njs/hmac_auth.js /etc/nginx/njs/hmac_auth.js
+COPY deploy/nginx/edge.conf /etc/nginx/conf.d/default.conf

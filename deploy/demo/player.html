@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vodstack — HLS demo player</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.2rem; }
+    input { width: 100%; padding: .6rem; box-sizing: border-box; font-family: monospace; }
+    button { margin-top: .6rem; padding: .55rem 1rem; cursor: pointer; }
+    video { width: 100%; margin-top: 1rem; background: #000; border-radius: 6px; }
+    .hint { color: #666; font-size: .85rem; }
+    code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>vodstack — HLS demo player</h1>
+  <p class="hint">
+    Paste the signed <code>hlsUrl</code> returned by
+    <code>GET /api/library/&lt;lib&gt;/videos/&lt;id&gt;/play</code> and press Play.
+    Adaptive quality is auto-selected by hls.js; use the picker to force a rendition.
+  </p>
+  <input id="url" placeholder="http://localhost:8081/hls/&lt;id&gt;/master.m3u8?exp=...&amp;token=..." />
+  <button id="play">Play</button>
+  <select id="level" style="margin-left:.6rem"><option value="-1">auto</option></select>
+  <video id="video" controls playsinline></video>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+  <script>
+    const video = document.getElementById('video');
+    const levelSel = document.getElementById('level');
+    let hls;
+
+    document.getElementById('play').onclick = () => {
+      const src = document.getElementById('url').value.trim();
+      if (!src) return;
+      if (hls) hls.destroy();
+
+      if (window.Hls && Hls.isSupported()) {
+        // Re-append the master URL's ?exp&token to every child request, since
+        // hls.js drops the query when resolving relative playlist/segment URLs.
+        var tokenQuery = (src.split('?')[1] || '');
+        var BaseLoader = Hls.DefaultConfig.loader;
+        function TokenLoader() { BaseLoader.apply(this, arguments); }
+        TokenLoader.prototype = Object.create(BaseLoader.prototype);
+        TokenLoader.prototype.constructor = TokenLoader;
+        TokenLoader.prototype.load = function (context, config, callbacks) {
+          if (tokenQuery && context && context.url && context.url.indexOf('token=') === -1) {
+            context.url += (context.url.indexOf('?') === -1 ? '?' : '&') + tokenQuery;
+          }
+          BaseLoader.prototype.load.call(this, context, config, callbacks);
+        };
+        hls = new Hls({ enableWorker: true, loader: TokenLoader });
+        hls.loadSource(src);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
+          levelSel.innerHTML = '<option value="-1">auto</option>';
+          data.levels.forEach((lvl, i) => {
+            const o = document.createElement('option');
+            o.value = i; o.textContent = lvl.height + 'p';
+            levelSel.appendChild(o);
+          });
+          video.play();
+        });
+        levelSel.onchange = () => { hls.currentLevel = parseInt(levelSel.value, 10); };
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari: native HLS
+        video.src = src;
+        video.play();
+      } else {
+        alert('HLS not supported in this browser.');
+      }
+    };
+  </script>
+</body>
+</html>
